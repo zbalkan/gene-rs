@@ -480,18 +480,18 @@ impl Rule {
             // initializing operands
             if let Some(matches) = self.matches {
                 let mut operands = HashMap::with_capacity(matches.len());
-                for (operand, s) in matches.iter() {
+                for (operand, s) in matches {
                     if !operand.starts_with('$') {
                         return Err(Error::Compile(format!(
                             "operand must start with $, try with ${operand}"
                         )));
                     }
-                    let m = Match::from_str(s)?;
+                    let m = Match::from_str(&s)?;
                     // we update the list of dependent rules
                     if let Match::Rule(r) = &m {
                         c.depends.insert(r.rule_name().into());
                     }
-                    operands.insert(operand.clone(), m);
+                    operands.insert(operand, m);
                 }
                 c.operands = operands.into_iter().collect();
             }
