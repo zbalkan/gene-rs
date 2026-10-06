@@ -26,7 +26,7 @@ lazy_static::lazy_static! {
     };
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Op {
     And,
     Or,
@@ -205,7 +205,7 @@ impl Expr {
             Expr::NOfVars(n, start) => BoundExpr::NOf(*n, prefixed(start)),
             Expr::BinOp { lhs, op, rhs } => BoundExpr::BinOp {
                 lhs: Box::new(lhs.bind(names)),
-                op: op.clone(),
+                op: *op,
                 rhs: Box::new(rhs.bind(names)),
             },
             Expr::Negate(expr) => BoundExpr::Negate(Box::new(expr.bind(names))),
