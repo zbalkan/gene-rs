@@ -24,7 +24,6 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     io,
     str::FromStr,
@@ -452,7 +451,7 @@ impl Rule {
                 attack: HashSet::new(),
                 include_events: Self::build_include_events(&filters),
                 exclude_events: Self::build_exclude_events(&filters),
-                matches: HashMap::new(),
+                operands: Vec::new(),
                 condition: match self.condition {
                     Some(cond) => {
                         Condition::from_str(&cond).map_err(|e| Error::from(Box::new(e)))?
@@ -480,6 +479,7 @@ impl Rule {
 
             // initializing operands
             if let Some(matches) = self.matches {
+                let mut operands = HashMap::with_capacity(matches.len());
                 for (operand, s) in matches.iter() {
                     if !operand.starts_with('$') {
                         return Err(Error::Compile(format!(
@@ -491,9 +491,11 @@ impl Rule {
                     if let Match::Rule(r) = &m {
                         c.depends.insert(r.rule_name().into());
                     }
-                    c.matches.insert(operand.clone(), m);
+                    operands.insert(operand.clone(), m);
                 }
+                c.operands = operands.into_iter().collect();
             }
+            c.condition.bind(&c.operands);
 
             Ok(c)
         }()
@@ -506,6 +508,48 @@ impl FromStr for Rule {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         serde_yaml::from_str(s)
+    }
+}
+
+/// Results of the rules evaluated during one scan, addressed by rule index.
+///
+/// Each slot records the epoch it was written in. Starting a new scan bumps
+/// the epoch, which invalidates every slot at once, so the buffer is reused
+/// across scans without being cleared or reallocated.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RuleStates {
+    epoch: u32,
+    slots: Vec<(u32, bool)>,
+}
+
+impl RuleStates {
+    /// Forgets all results and sizes the buffer for `len` rules.
+    #[inline]
+    pub(crate) fn reset(&mut self, len: usize) {
+        if self.slots.len() != len {
+            self.slots.resize(len, (0, false));
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        // on wrap-around, slots written 2^32 scans ago would look current
+        if self.epoch == 0 {
+            self.slots.fill((0, false));
+            self.epoch = 1;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> Option<bool> {
+        self.slots
+            .get(i)
+            .filter(|(epoch, _)| *epoch == self.epoch)
+            .map(|&(_, ok)| ok)
+    }
+
+    #[inline]
+    pub(crate) fn set(&mut self, i: usize, ok: bool) {
+        if let Some(slot) = self.slots.get_mut(i) {
+            *slot = (self.epoch, ok);
+        }
     }
 }
 
@@ -525,7 +569,7 @@ impl FromStr for Rule {
 ///
 /// The compiled form uses optimized data structures:
 /// - `HashSet` for O(1) lookups of tags, attack IDs, and actions
-/// - `HashMap` for efficient field match expression access
+/// - `Vec` of match expressions, addressed by index from the compiled condition
 /// - Pre-parsed conditions for faster evaluation
 /// - Event filtering maps for quick event matching checks
 ///
@@ -540,7 +584,9 @@ pub struct CompiledRule {
     pub(crate) attack: HashSet<String>,
     pub(crate) include_events: HashMap<String, HashSet<i64>>,
     pub(crate) exclude_events: HashMap<String, HashSet<i64>>,
-    pub(crate) matches: HashMap<String, Match>,
+    // operands in the iteration order of the map they were parsed into,
+    // which is the order group operators (`all of them`...) evaluate them in
+    pub(crate) operands: Vec<(String, Match)>,
     pub(crate) condition: condition::Condition,
     pub(crate) severity: u8,
     pub(crate) actions: HashSet<String>,
@@ -620,7 +666,7 @@ impl CompiledRule {
         E: for<'e> Event<'e>,
     {
         self.condition
-            .compute_for_event(event, &self.matches, &HashMap::new())
+            .compute_for_event(event, &self.operands, &RuleStates::default())
             .map_err(|e| Box::new(e).into())
             .map_err(|e: Error| e.wrap(self.name.clone()))
     }
@@ -629,15 +675,26 @@ impl CompiledRule {
     pub(crate) fn match_event_with_states<E>(
         &self,
         event: &E,
-        rules_states: &HashMap<Cow<'_, str>, bool>,
+        rules_states: &RuleStates,
     ) -> Result<bool, Error>
     where
         E: for<'e> Event<'e>,
     {
         self.condition
-            .compute_for_event(event, &self.matches, rules_states)
+            .compute_for_event(event, &self.operands, rules_states)
             .map_err(|e| Box::new(e).into())
             .map_err(|e: Error| e.wrap(self.name.clone()))
+    }
+
+    /// Resolves `rule(name)` operands to the referenced rules' indices.
+    pub(crate) fn bind_rule_dependencies(&mut self, names: &HashMap<String, usize>) {
+        for (_, m) in self.operands.iter_mut() {
+            if let Match::Rule(r) = m {
+                if let Some(&i) = names.get(r.rule_name()) {
+                    r.set_rule_index(i);
+                }
+            }
+        }
     }
 
     #[inline(always)]
@@ -1243,5 +1300,42 @@ condition: none of $ip
 ..."#;
 
         assert!(serde_yaml::from_str::<Rule>(test).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rule_states_test {
+    use super::RuleStates;
+
+    #[test]
+    fn test_reset_invalidates_previous_results() {
+        let mut st = RuleStates::default();
+        st.reset(2);
+        st.set(0, true);
+        assert_eq!(st.get(0), Some(true));
+        assert_eq!(st.get(1), None);
+        st.reset(2);
+        assert_eq!(st.get(0), None);
+    }
+
+    #[test]
+    fn test_epoch_wrap_around() {
+        let mut st = RuleStates::default();
+        st.reset(1);
+        st.set(0, true);
+        // force the next reset to wrap the epoch
+        st.epoch = u32::MAX;
+        st.reset(1);
+        assert_eq!(st.get(0), None);
+        st.set(0, false);
+        assert_eq!(st.get(0), Some(false));
+    }
+
+    #[test]
+    fn test_out_of_range_index() {
+        let mut st = RuleStates::default();
+        st.reset(1);
+        st.set(5, true);
+        assert_eq!(st.get(5), None);
     }
 }

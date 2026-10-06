@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     compiler,
-    rules::{self, bound_severity, CompiledRule, Decision},
+    rules::{self, bound_severity, CompiledRule, Decision, RuleStates},
     Compiler, Event, FieldNameIterator, FieldValue,
 };
 
@@ -561,10 +561,11 @@ pub struct Engine {
     // key: (source, event_id)
     // value: vector of rule indexes
     rules_cache: HashMap<(Cow<'static, str>, i64), RuleCacheEntry>,
-    // cache rules dependencies
-    // key: rule index
-    // value: vector of dependency indexes
-    deps_cache: HashMap<usize, Vec<usize>>,
+    // cache rules dependencies, indexed like `rules`
+    // value: vector of dependency indexes (empty without dependencies)
+    deps_cache: Vec<Vec<usize>>,
+    // per-scan results of evaluated rules, reused across scans
+    rule_states: RuleStates,
 }
 
 impl TryFrom<Compiler> for Engine {
@@ -589,8 +590,11 @@ impl Engine {
     }
 
     #[inline(always)]
-    pub(crate) fn insert_compiled(&mut self, r: CompiledRule) {
+    pub(crate) fn insert_compiled(&mut self, mut r: CompiledRule) {
         let has_deps = !r.depends.is_empty();
+
+        // dependencies are inserted before the rules using them
+        r.bind_rule_dependencies(&self.names);
 
         // this is the index the rule is going to be inserted at
         let rule_idx = self.rules.len();
@@ -599,10 +603,12 @@ impl Engine {
 
         // since we know all the dependent rules are there, we can cache
         // the list of dependencies and we never need to compute it again
-        if has_deps {
-            self.deps_cache
-                .insert(rule_idx, self.dfs_dep_search(rule_idx));
-        }
+        let deps = if has_deps {
+            self.dfs_dep_search(rule_idx)
+        } else {
+            Vec::new()
+        };
+        self.deps_cache.push(deps);
 
         // cache becomes outdated
         self.rules_cache.clear();
@@ -709,6 +715,10 @@ impl Engine {
         let src = event.source();
         let id = event.id();
 
+        // taken out of self for the duration of the scan and put back below
+        let mut states = std::mem::take(&mut self.rule_states);
+        states.reset(self.rules.len());
+
         // a cache hit costs a single lookup, the cache is filled on miss only
         let cached_rules = match self.cached_rules(&src, id) {
             Some(cached) => cached,
@@ -718,7 +728,6 @@ impl Engine {
                     .expect("cache_rules always inserts an entry for (source, id)")
             }
         };
-        let mut states = HashMap::new();
 
         // we iterate over each because we don't want exclude rules from filter
         // exclude to impact detection include and vice versa
@@ -728,28 +737,26 @@ impl Engine {
                 let r = self.rules.get(*i).unwrap();
 
                 if !r.depends.is_empty() {
-                    debug_assert!(self.deps_cache.contains_key(i));
+                    debug_assert!(self.deps_cache.get(*i).is_some_and(|d| !d.is_empty()));
                     // there are some dependent rules to match against
-                    if let Some(deps) = self.deps_cache.get(i) {
+                    if let Some(deps) = self.deps_cache.get(*i) {
                         // we match every dependency of the rule first
                         for &r_i in deps.iter() {
                             if let Some(r) = self.rules.get(r_i) {
                                 // we don't need to compute rule again
                                 // NB: rule might be used in several places and already computed
-                                if states.contains_key(&Cow::Borrowed(r.name.as_str())) {
+                                if states.get(r_i).is_some() {
                                     continue;
                                 }
 
                                 // if the rule cannot match we don't need to go further
                                 if !r.can_match_on(event.source(), id) {
-                                    states.insert(Cow::Borrowed(r.name.as_str()), false);
+                                    states.set(r_i, false);
                                     continue;
                                 }
 
                                 match r.match_event_with_states(event, &states) {
-                                    Ok(ok) => {
-                                        states.insert(Cow::Borrowed(r.name.as_str()), ok);
-                                    }
+                                    Ok(ok) => states.set(r_i, ok),
                                     Err(e) => last_err = Some(e),
                                 }
                             }
@@ -759,8 +766,8 @@ impl Engine {
 
                 // if the rule has already been matched in the process
                 // of dependency matching of whatever rule
-                let ok = match states.get(&Cow::Borrowed(r.name.as_str())) {
-                    Some(&ok) => ok,
+                let ok = match states.get(*i) {
+                    Some(ok) => ok,
                     None => match r.match_event_with_states(event, &states) {
                         Ok(ok) => ok,
                         Err(e) => {
@@ -781,6 +788,8 @@ impl Engine {
                 }
             }
         }
+
+        self.rule_states = states;
 
         if let Some(err) = last_err {
             return Err((sr, err).into());
@@ -1192,7 +1201,7 @@ condition: all of them
         // we check the dep cache is correct
         assert_eq!(
             e.deps_cache
-                .get(e.names.get("multi.deps").unwrap())
+                .get(*e.names.get("multi.deps").unwrap())
                 .unwrap()
                 .len(),
             2
@@ -1240,7 +1249,7 @@ condition: all of them
         let mut e = Engine::try_from(c).unwrap();
 
         let idx = |name: &str| *e.names.get(name).unwrap();
-        let deps = e.deps_cache.get(&idx("top")).unwrap();
+        let deps = e.deps_cache.get(idx("top")).unwrap();
 
         assert_eq!(deps.len(), 3);
         assert_eq!(deps.iter().collect::<HashSet<_>>().len(), deps.len());
@@ -1281,7 +1290,7 @@ condition: all of them
         c.load_rules_from_str(rules).unwrap();
         let mut e = Engine::try_from(c).unwrap();
 
-        let deps = e.deps_cache.get(e.names.get("top").unwrap()).unwrap();
+        let deps = e.deps_cache.get(*e.names.get("top").unwrap()).unwrap();
         assert_eq!(deps.len(), 3 * DEPTH + 1);
         assert_eq!(deps.iter().collect::<HashSet<_>>().len(), deps.len());
 
@@ -1674,5 +1683,62 @@ condition: $a and $b
             })
             .unwrap();
         assert!(sr.includes_detection("test"));
+    }
+
+    #[test]
+    fn test_group_operator_follows_operand_order() {
+        fake_event!(Dummy, id = 1, source = "test", (".present", "x"));
+
+        let mut c = Compiler::new();
+        c.load_rules_from_str(
+            r#"
+name: test
+matches:
+    $a: .present == "x"
+    $b: .missing == "x"
+condition: any of them
+"#,
+        )
+        .unwrap();
+        let mut e = Engine::try_from(c).unwrap();
+
+        // operands are evaluated in their stored order: a missing field met
+        // before the matching operand is an error, otherwise the rule matches
+        let missing_first = e.rules[0].operands[0].0 == "$b";
+        let res = e.scan(&Dummy {});
+        if missing_first {
+            assert!(res.is_err());
+        } else {
+            assert!(res.unwrap().includes_detection("test"));
+        }
+    }
+
+    #[test]
+    fn test_dependency_states_reset_between_scans() {
+        fake_event!(Match, id = 1, source = "test", (".a", "x"));
+        fake_event!(NoMatch, id = 1, source = "test", (".a", "y"));
+
+        let mut c = Compiler::new();
+        c.load_rules_from_str(
+            r#"
+name: dep
+type: dependency
+matches:
+    $a: .a == "x"
+condition: $a
+---
+name: main
+matches:
+    $d: rule(dep)
+condition: $d
+"#,
+        )
+        .unwrap();
+        let mut e = Engine::try_from(c).unwrap();
+
+        // a dependency result must not leak from one scan into the next
+        assert!(e.scan(&Match {}).unwrap().includes_detection("main"));
+        assert!(!e.scan(&NoMatch {}).unwrap().includes_detection("main"));
+        assert!(e.scan(&Match {}).unwrap().includes_detection("main"));
     }
 }

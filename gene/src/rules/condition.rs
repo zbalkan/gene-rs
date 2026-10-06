@@ -1,7 +1,10 @@
-use super::matcher::{self, Match};
+use super::{
+    matcher::{self, Match},
+    RuleStates,
+};
 use crate::Event;
 use pest::{iterators::Pairs, pratt_parser::PrattParser, Parser};
-use std::{borrow::Cow, collections::HashMap, hash::Hash, str::FromStr};
+use std::{collections::HashMap, hash::Hash, str::FromStr};
 use thiserror::Error;
 
 #[derive(pest_derive::Parser)]
@@ -55,6 +58,97 @@ impl Default for Expr {
     }
 }
 
+/// [`Expr`] with operands resolved to their index in the rule's operand
+/// list, so evaluation does not look operands up by name.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) enum BoundExpr {
+    Operand(usize),
+    // kept so that an unknown operand still fails at evaluation time
+    UnknownOperand(String),
+    AllOf(Vec<usize>),
+    AnyOf(Vec<usize>),
+    NoneOf(Vec<usize>),
+    NOf(usize, Vec<usize>),
+    BinOp {
+        lhs: Box<BoundExpr>,
+        op: Op,
+        rhs: Box<BoundExpr>,
+    },
+    Negate(Box<BoundExpr>),
+    #[default]
+    None,
+}
+
+impl BoundExpr {
+    #[inline]
+    fn compute_for_event<E>(
+        &self,
+        event: &E,
+        operands: &[(String, Match)],
+        rule_states: &RuleStates,
+    ) -> Result<bool, Error>
+    where
+        E: for<'e> Event<'e>,
+    {
+        // indexes come from bind() over the same operand list
+        let operand = |i: &usize| {
+            operands
+                .get(*i)
+                .map(|(_, m)| m)
+                .ok_or_else(|| Error::UnknowOperand(i.to_string()))
+        };
+
+        match self {
+            BoundExpr::Operand(i) => Ok(operand(i)?.match_event(event, rule_states)?),
+            BoundExpr::UnknownOperand(var) => Err(Error::UnknowOperand(var.clone())),
+            BoundExpr::AllOf(idx) => {
+                for i in idx {
+                    if !operand(i)?.match_event(event, rule_states)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            BoundExpr::AnyOf(idx) => {
+                for i in idx {
+                    if operand(i)?.match_event(event, rule_states)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            BoundExpr::NoneOf(idx) => {
+                for i in idx {
+                    if operand(i)?.match_event(event, rule_states)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            BoundExpr::NOf(n, idx) => {
+                let mut c = 0;
+                for i in idx {
+                    if operand(i)?.match_event(event, rule_states)? {
+                        c += 1;
+                        if c >= *n {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(c >= *n)
+            }
+            BoundExpr::BinOp { lhs, op, rhs } => match op {
+                Op::And => Ok(lhs.compute_for_event(event, operands, rule_states)?
+                    && rhs.compute_for_event(event, operands, rule_states)?),
+                Op::Or => Ok(lhs.compute_for_event(event, operands, rule_states)?
+                    || rhs.compute_for_event(event, operands, rule_states)?),
+            },
+            BoundExpr::Negate(expr) => Ok(!expr.compute_for_event(event, operands, rule_states)?),
+            BoundExpr::None => Ok(true),
+        }
+    }
+}
+
 #[derive(Error, Debug, PartialEq)]
 pub enum Error {
     #[error("unknown operand {0}")]
@@ -82,119 +176,40 @@ impl FromStr for Expr {
 }
 
 impl Expr {
-    #[inline]
-    fn compute_for_event<E>(
-        &self,
-        event: &E,
-        operands: &HashMap<String, Match>,
-        rule_states: &HashMap<Cow<'_, str>, bool>,
-    ) -> Result<bool, Error>
-    where
-        E: for<'e> Event<'e>,
-    {
+    /// Resolves operand names against `names`, given in the order the
+    /// operands are stored in [`CompiledRule`](crate::rules::CompiledRule).
+    /// Group operators keep that order, so evaluation order is unchanged.
+    fn bind(&self, names: &[&str]) -> BoundExpr {
+        let all = || (0..names.len()).collect::<Vec<_>>();
+        let prefixed = |start: &str| {
+            names
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.starts_with(start))
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        };
+
         match self {
-            Expr::AllOfThem => {
-                for m in operands.values() {
-                    if !m.match_event(event, rule_states)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            Expr::AllOfVars(start) => {
-                for m in operands
-                    .iter()
-                    .filter(|(v, _)| v.starts_with(start))
-                    .map(|(_, m)| m)
-                {
-                    if !m.match_event(event, rule_states)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            Expr::NOfThem(n) => {
-                let mut c = 0;
-                for m in operands.values() {
-                    if m.match_event(event, rule_states)? {
-                        c += 1;
-                        if c >= *n {
-                            return Ok(true);
-                        }
-                    }
-                }
-                Ok(c >= *n)
-            }
-            Expr::NOfVars(n, start) => {
-                let mut c = 0;
-                for m in operands
-                    .iter()
-                    .filter(|(v, _)| v.starts_with(start))
-                    .map(|(_, m)| m)
-                {
-                    if m.match_event(event, rule_states)? {
-                        c += 1;
-                        if c >= *n {
-                            return Ok(true);
-                        }
-                    }
-                }
-                Ok(c >= *n)
-            }
-            Expr::AnyOfThem => {
-                for m in operands.values() {
-                    if m.match_event(event, rule_states)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            Expr::AnyOfVars(start) => {
-                for m in operands
-                    .iter()
-                    .filter(|(v, _)| v.starts_with(start))
-                    .map(|(_, m)| m)
-                {
-                    if m.match_event(event, rule_states)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            Expr::NoneOfThem => {
-                for m in operands.values() {
-                    if m.match_event(event, rule_states)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            Expr::NoneOfVars(start) => {
-                for m in operands
-                    .iter()
-                    .filter(|(v, _)| v.starts_with(start))
-                    .map(|(_, m)| m)
-                {
-                    if m.match_event(event, rule_states)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            Expr::Variable(var) => {
-                if let Some(m) = operands.get(var) {
-                    return m.match_event(event, rule_states).map_err(|e| e.into());
-                }
-                Err(Error::UnknowOperand(var.into()))
-            }
-            Expr::BinOp { lhs, op, rhs } => match op {
-                Op::And => Ok(lhs.compute_for_event(event, operands, rule_states)?
-                    && rhs.compute_for_event(event, operands, rule_states)?),
-                Op::Or => Ok(lhs.compute_for_event(event, operands, rule_states)?
-                    || rhs.compute_for_event(event, operands, rule_states)?),
+            Expr::Variable(var) => match names.iter().position(|n| n == var) {
+                Some(i) => BoundExpr::Operand(i),
+                None => BoundExpr::UnknownOperand(var.clone()),
             },
-            Expr::Negate(expr) => Ok(!expr.compute_for_event(event, operands, rule_states)?),
-            Expr::None => Ok(true),
+            Expr::AllOfThem => BoundExpr::AllOf(all()),
+            Expr::AllOfVars(start) => BoundExpr::AllOf(prefixed(start)),
+            Expr::AnyOfThem => BoundExpr::AnyOf(all()),
+            Expr::AnyOfVars(start) => BoundExpr::AnyOf(prefixed(start)),
+            Expr::NoneOfThem => BoundExpr::NoneOf(all()),
+            Expr::NoneOfVars(start) => BoundExpr::NoneOf(prefixed(start)),
+            Expr::NOfThem(n) => BoundExpr::NOf(*n, all()),
+            Expr::NOfVars(n, start) => BoundExpr::NOf(*n, prefixed(start)),
+            Expr::BinOp { lhs, op, rhs } => BoundExpr::BinOp {
+                lhs: Box::new(lhs.bind(names)),
+                op: op.clone(),
+                rhs: Box::new(rhs.bind(names)),
+            },
+            Expr::Negate(expr) => BoundExpr::Negate(Box::new(expr.bind(names))),
+            Expr::None => BoundExpr::None,
         }
     }
 
@@ -327,10 +342,12 @@ fn parse_expr(pairs: Pairs<Rule>) -> Expr {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Condition {
     pub(crate) expr: Expr,
+    bound: BoundExpr,
 }
 
 impl FromStr for Condition {
     type Err = Error;
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Expr::from_str(s)?.into())
     }
@@ -338,21 +355,31 @@ impl FromStr for Condition {
 
 impl From<Expr> for Condition {
     fn from(value: Expr) -> Self {
-        Self { expr: value }
+        Self {
+            expr: value,
+            bound: BoundExpr::None,
+        }
     }
 }
 
 impl Condition {
+    /// Resolves the condition against the rule's operands. Must be called
+    /// once the operand list is final, before any evaluation.
+    pub(crate) fn bind(&mut self, operands: &[(String, Match)]) {
+        let names: Vec<&str> = operands.iter().map(|(n, _)| n.as_str()).collect();
+        self.bound = self.expr.bind(&names);
+    }
+
     pub(crate) fn compute_for_event<E>(
         &self,
         event: &E,
-        operands: &HashMap<String, Match>,
-        rules_states: &HashMap<Cow<'_, str>, bool>,
+        operands: &[(String, Match)],
+        rules_states: &RuleStates,
     ) -> Result<bool, Error>
     where
         E: for<'e> Event<'e>,
     {
-        self.expr.compute_for_event(event, operands, rules_states)
+        self.bound.compute_for_event(event, operands, rules_states)
     }
 }
 
