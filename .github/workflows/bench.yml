@@ -1,0 +1,108 @@
+# Temporary workflow: compares the criterion benchmarks of this branch with
+# upstream main on the same runner. To be deleted before merge.
+name: Benchmarks
+
+on:
+  push:
+    branches: ['perf/indexed-rule-state*']
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Baseline commit or ref in kunai-project/gene-rs
+        required: true
+        default: ebc0f47727f7859382d90bc256a932b77b1ae1ba
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    # never run if this file ends up in another repository
+    if: github.repository == 'zbalkan/gene-rs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      # one criterion directory shared by both checkouts so --baseline finds the saved data
+      CRITERION_HOME: ${{ github.workspace }}/criterion
+      # upstream main this branch is based on (PR #26 merged)
+      BASE_REPO: kunai-project/gene-rs
+      BASE_REF: ${{ inputs.base || 'ebc0f47727f7859382d90bc256a932b77b1ae1ba' }}
+    steps:
+      - name: Checkout head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: head
+          persist-credentials: false
+
+      - name: Checkout base
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.BASE_REPO }}
+          ref: ${{ env.BASE_REF }}
+          path: base
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      - name: Use the head benchmark harness for both checkouts
+        # the base lacks the benchmark groups added by this branch
+        run: cp head/gene/benches/engine_benchmark.rs base/gene/benches/engine_benchmark.rs
+
+      # Separate target dirs are required: cargo hashes workspace members by
+      # their path relative to the workspace root, so a shared target dir lets
+      # one checkout silently reuse binaries built from the other.
+      - name: Build both checkouts
+        run: |
+          (cd base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-base" cargo bench -p gene --bench engine_benchmark --no-run)
+          (cd head && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-head" cargo bench -p gene --bench engine_benchmark --no-run)
+
+      # Two base/head rounds: if the base drifts between rounds, runner noise
+      # is larger than the measured change and neither round should be quoted.
+      - name: Benchmark, two alternating rounds
+        run: |
+          set -o pipefail
+          for round in 1 2; do
+            (cd base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-base" \
+              cargo bench -p gene --bench engine_benchmark -- --save-baseline main --noplot \
+              | tee "$RUNNER_TEMP/base-$round.txt")
+            (cd head && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-head" \
+              cargo bench -p gene --bench engine_benchmark -- --baseline main --noplot \
+              | tee "$RUNNER_TEMP/head-$round.txt")
+          done
+
+      - name: Job summary
+        run: |
+          {
+            echo "## Criterion: \`${GITHUB_REF_NAME}\` (${GITHUB_SHA::7}) vs main \`$BASE_REPO@${BASE_REF::7}\`"
+            for round in 1 2; do
+              echo
+              echo "### Round $round: head compared with main"
+              echo '```text'
+              grep -E '^[a-z-]+/|time:|thrpt:|change:|Performance|No change|within noise' "$RUNNER_TEMP/head-$round.txt" || true
+              echo '```'
+            done
+            echo
+            echo "### Main drift between rounds (time estimates of each run)"
+            echo '```text'
+            first_time() {
+              awk '/^[a-z-]+\//{n=$0; f=1; next} f && /time:/{sub(/^ *time: */, ""); print n, $0; f=0}' "$1"
+            }
+            paste -d'\n' <(first_time "$RUNNER_TEMP/base-1.txt" | sed 's/^/round 1: /') \
+                          <(first_time "$RUNNER_TEMP/base-2.txt" | sed 's/^/round 2: /')
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload criterion data
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: criterion-${{ github.run_id }}
+          path: |
+            criterion
+            ${{ runner.temp }}/*.txt
+          retention-days: 14
