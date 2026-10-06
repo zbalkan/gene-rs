@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap, str::FromStr};
+use std::str::FromStr;
 
 use pest::{
     error::ErrorVariant,
@@ -15,6 +15,8 @@ use crate::{
 };
 
 use crate::paths::{PathError, XPath};
+
+use super::RuleStates;
 
 #[derive(Parser)]
 #[grammar = "rules/grammars/match.pest"]
@@ -193,11 +195,7 @@ impl FromStr for Match {
 
 impl Match {
     #[inline]
-    pub(crate) fn match_event<E>(
-        &self,
-        event: &E,
-        rule_state: &HashMap<Cow<'_, str>, bool>,
-    ) -> Result<bool, Error>
+    pub(crate) fn match_event<E>(&self, event: &E, rule_state: &RuleStates) -> Result<bool, Error>
     where
         E: for<'e> Event<'e>,
     {
@@ -249,15 +247,11 @@ impl IndirectMatch {
     {
         let src = event
             .get_from_path(&self.field_path)
-            .ok_or(Error::FieldNotFound(
-                self.field_path.to_string_lossy().into(),
-            ))?;
+            .ok_or_else(|| Error::FieldNotFound(self.field_path.to_string_lossy().into()))?;
 
         let tgt = event
             .get_from_path(&self.other_field)
-            .ok_or(Error::FieldNotFound(
-                self.other_field.to_string_lossy().into(),
-            ))?;
+            .ok_or_else(|| Error::FieldNotFound(self.other_field.to_string_lossy().into()))?;
 
         Ok(src == tgt)
     }
@@ -507,8 +501,10 @@ impl DirectMatch {
     }
 }
 
+/// Reference to another rule's result. The second field is the referenced
+/// rule's index in the engine, set by [`Engine`](crate::Engine) on insertion.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RuleMatch(String);
+pub(crate) struct RuleMatch(String, Option<usize>);
 
 impl RuleMatch {
     #[inline]
@@ -517,7 +513,7 @@ impl RuleMatch {
         let mut out = None;
         for pair in pair.into_inner() {
             match pair.as_rule() {
-                Rule::rule_name => out = Some(RuleMatch(pair.as_str().into())),
+                Rule::rule_name => out = Some(RuleMatch(pair.as_str().into(), None)),
                 // grammar doesn't allow anything else
                 _ => unreachable!(),
             }
@@ -526,16 +522,20 @@ impl RuleMatch {
     }
 
     #[inline]
-    pub(crate) fn match_event(&self, states: &HashMap<Cow<'_, str>, bool>) -> Result<bool, Error> {
-        states
-            .get(&Cow::from(&self.0))
-            .copied()
-            .ok_or(Error::rule_not_found(&self.0))
+    pub(crate) fn match_event(&self, states: &RuleStates) -> Result<bool, Error> {
+        self.1
+            .and_then(|i| states.get(i))
+            .ok_or_else(|| Error::rule_not_found(&self.0))
     }
 
     #[inline(always)]
     pub(crate) fn rule_name(&self) -> &str {
         &self.0
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_rule_index(&mut self, i: usize) {
+        self.1 = Some(i);
     }
 }
 
@@ -680,12 +680,12 @@ mod test {
 
         assert_eq!(
             as_rule_match(MatchParser::parse_input("rule(test)").unwrap()),
-            RuleMatch("test".into())
+            RuleMatch("test".into(), None)
         );
 
         assert_eq!(
             as_rule_match(MatchParser::parse_input("rule(blip.blop)").unwrap()),
-            RuleMatch("blip.blop".into())
+            RuleMatch("blip.blop".into(), None)
         )
     }
 }
